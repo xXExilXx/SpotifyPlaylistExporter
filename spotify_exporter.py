@@ -1,99 +1,102 @@
 import requests
-import time
 import webbrowser
-from selenium import webdriver
-import base64
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.parse
 
-
-class SpotifyExporter:
-    def __init__(self):
-        self.SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
-        self.client_id = "3202554082f747cea5899a854a8959bb"
-        self.client_secret = "fe10ca3b20c6483ebf8082394596b758"
-        self.redirect_uri = "http://localhost:8080/callback"
-        self.scopes = ["playlist-read-private", "playlist-read-collaborative"]
+class SpotifyPlaylistCSV:
+    def __init__(self, client_id, client_secret, port=8888):
+        self.client_id = client_id
+        self.client_secret = client_secret
         self.access_token = None
-        self.auth_server = self._start_authentication_server()
+        self.redirect_uri = f"http://localhost:{port}/callback"
+        self.auth_url = "https://accounts.spotify.com/authorize"
+        self.token_url = "https://accounts.spotify.com/api/token"
+        self.port = port
+        self.server = None
 
-    def _start_authentication_server(self):
-        class AuthHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(200)
-                self.send_header('Content-type', 'text/html')
-                self.end_headers()
-                self.server.auth_code = self.path.split('code=')[1]
+    def authorize(self):
+        server_address = ("", self.port)
+        self.server = HTTPServer(server_address, AuthHandler(self))
+        self.server.handle_request()
 
-        server = HTTPServer(('localhost', 8080), AuthHandler)
-        server.auth_code = None
-        server_thread = threading.Thread(target=server.serve_forever)
-        server_thread.daemon = True
-        server_thread.start()
-        return server
+        auth_query_params = {
+            "client_id": self.client_id,
+            "response_type": "code",
+            "redirect_uri": self.redirect_uri,
+            "scope": "playlist-read-private playlist-read-collaborative",
+        }
 
-    def _get_access_token(self):
-        options = webdriver.ChromeOptions()
-        options.add_argument('--headless')
-        driver = webdriver.Chrome(options=options)
-
-        auth_url = f"https://accounts.spotify.com/authorize?client_id={self.client_id}&redirect_uri={self.redirect_uri}&scope={'+'.join(self.scopes)}&response_type=code"
-
-        # Open the web browser for the user to log in
+        auth_url = f"{self.auth_url}?{urllib.parse.urlencode(auth_query_params)}"
         webbrowser.open(auth_url)
 
-        while "code=" not in driver.current_url:
-            time.sleep(1)
-
-        authorization_code = driver.current_url.split('code=')[1]
-        driver.quit()
-
-        token_url = 'https://accounts.spotify.com/api/token'
-        headers = {
-            'Authorization': 'Basic ' + base64.b64encode(f'{self.client_id}:{self.client_secret}'.encode()).decode(),
+    def get_access_token(self, auth_code):
+        token_data = {
+            "grant_type": "authorization_code",
+            "code": auth_code,
+            "redirect_uri": self.redirect_uri,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
         }
-        data = {
-            'grant_type': 'authorization_code',
-            'code': authorization_code,
-            'redirect_uri': self.redirect_uri,
-        }
-        response = requests.post(token_url, headers=headers, data=data)
 
+        response = requests.post(self.token_url, data=token_data)
         if response.status_code == 200:
-            self.access_token = response.json()['access_token']
+            self.access_token = response.json()["access_token"]
+            print("Authorization successful.")
         else:
-            raise Exception(f"Error {response.status_code}: {response.text}")
+            print("Authorization failed.")
 
-    def _make_api_call(self, url, params=None):
+    def api_call(self, url):
         if not self.access_token:
-            self._get_access_token()
+            raise Exception("Authorization token is missing. Please authorize.")
 
-        headers = {
-            "Authorization": f"Bearer {self.access_token}"
-        }
-
-        response = requests.get(url, headers=headers, params=params)
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        response = requests.get(url, headers=headers)
         if response.status_code == 200:
             return response.json()
+        elif response.status_code == 401:
+            raise Exception("Authorization token expired. Please reauthorize.")
+        elif response.status_code == 429:
+            raise Exception("Rate limiting error. Please try again later.")
         else:
-            raise Exception(f"Error {response.status_code}: {response.text}")
+            raise Exception(f"Failed to fetch data from Spotify API. Status code: {response.status_code}")
 
-    def export_playlist(self, playlist_id):
-        playlist_response = self._make_api_call(f"{self.SPOTIFY_API_BASE_URL}/playlists/{playlist_id}")
-        playlist_tracks_response = self._make_api_call(f"{self.SPOTIFY_API_BASE_URL}/playlists/{playlist_id}/tracks")
-        playlist_tracks = playlist_tracks_response["items"]
+    def get_playlist_csv(self, playlist_id):
+        try:
+            playlist_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+            playlist_data = self.api_call(playlist_url)
+            tracks = playlist_data.get("items", [])
 
-        csv_data = ""
-        csv_data += "Track Name, Artist(s), Album, Release Date, Duration (ms)\n"
+            csv_data = "Spotify ID,Artist(s),Track Name,Album Name,Artist Name(s),Release Date,Duration (ms),Popularity,Added By,Added At\n"
 
-        for track in playlist_tracks:
-            track_data = [
-                track["track"]["name"],
-                ", ".join([artist["name"] for artist in track["track"]["artists"]]),
-                track["track"]["album"]["name"],
-                track["track"]["album"]["release_date"],
-                track["track"]["duration_ms"]
-            ]
-            csv_data += ",".join(['"{}"'.format(item) for item in track_data]) + "\n"
+            for item in tracks:
+                track = item["track"]
+                artists = ", ".join([artist["name"] for artist in track["artists"]])
+                csv_data += (
+                    f"{track['id']},{artists},{track['name']},{track['album']['name']},{artists},"
+                    f"{track['album']['release_date']},{track['duration_ms']},{track['popularity']},"
+                    f"{item['added_by']['uri']},{item['added_at']}\n"
+                )
 
-        return csv_data
+            return csv_data
+        except Exception as e:
+            return str(e)
+
+class AuthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+
+        if "code" in query_params:
+            auth_code = query_params["code"][0]
+            self.spotify_exporter.get_access_token(auth_code)
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"Authorization complete. You can close this window.")
+            self.spotify_exporter.server.shutdown()
+        else:
+            self.send_response(400)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"Invalid request.")
+
